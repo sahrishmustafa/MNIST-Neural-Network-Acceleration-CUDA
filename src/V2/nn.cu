@@ -5,13 +5,15 @@
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
-#define INPUT_SIZE   784
-#define HIDDEN_SIZE  128
-#define OUTPUT_SIZE  10
+#define INPUT_SIZE    784
+#define HIDDEN_SIZE   128
+#define OUTPUT_SIZE   10
 #define LEARNING_RATE 0.01
-#define EPOCHS       3
-#define BATCH_SIZE   64
-#define NUM_CLASSES  10  // Digits 0-9
+#define EPOCHS        3
+#define BATCH_SIZE    64
+#define NUM_CLASSES   10  // Digits 0-9
+#define NUM_TRAIN     60000
+#define NUM_TEST      10000
 
 // Timer function
 double get_time(clock_t start) {
@@ -60,7 +62,7 @@ void softmax(double* x, int size) {
 // Each thread computes one neuron in the hidden layer.
 __global__ void forwardHidden(double* d_W1, double* d_b1, double* d_input, double* d_hidden) {
     int i = threadIdx.x;
-    if(i < HIDDEN_SIZE){
+    if(i < HIDDEN_SIZE) {
         double sum = d_b1[i];
         for (int j = 0; j < INPUT_SIZE; j++){
             sum += d_W1[i * INPUT_SIZE + j] * d_input[j];
@@ -72,7 +74,7 @@ __global__ void forwardHidden(double* d_W1, double* d_b1, double* d_input, doubl
 // Each thread computes one neuron in the output layer.
 __global__ void forwardOutput(double* d_W2, double* d_b2, double* d_hidden, double* d_output) {
     int i = threadIdx.x;
-    if(i < OUTPUT_SIZE){
+    if(i < OUTPUT_SIZE) {
         double sum = d_b2[i];
         for (int j = 0; j < HIDDEN_SIZE; j++){
             sum += d_W2[i * HIDDEN_SIZE + j] * d_hidden[j];
@@ -81,15 +83,8 @@ __global__ void forwardOutput(double* d_W2, double* d_b2, double* d_hidden, doub
     }
 }
 
-// Compute output gradient: d_dOutput = output - target
-__global__ void computeOutputGradients(double* d_output, double* d_target, double* d_dOutput) {
-    int i = threadIdx.x;
-    if(i < OUTPUT_SIZE) {
-        d_dOutput[i] = d_output[i] - d_target[i];
-    }
-}
-
 // Compute hidden gradient: d_dHidden = (W2^T * d_dOutput) * (hidden > 0)
+// (This kernel remains unchanged.)
 __global__ void computeHiddenGradients(double* d_W2, double* d_dOutput, double* d_hidden, double* d_dHidden) {
     int i = threadIdx.x;
     if(i < HIDDEN_SIZE) {
@@ -128,7 +123,7 @@ __global__ void updateHiddenLayer(double* d_W1, double* d_b1, double* d_dHidden,
 }
 
 // -----------------------
-// Neural Network Structure
+// Neural Network Structure (Parameters reside on device)
 // -----------------------
 typedef struct {
     // Device pointers for parameters (flattened arrays)
@@ -139,7 +134,7 @@ typedef struct {
 } NeuralNetwork;
 
 // -----------------------
-// Create and Initialize Network (Device Parameters)
+// Create and Initialize Network (Parameters on Device)
 // -----------------------
 NeuralNetwork* createNetwork() {
     NeuralNetwork* net = (NeuralNetwork*)malloc(sizeof(NeuralNetwork));
@@ -176,129 +171,127 @@ NeuralNetwork* createNetwork() {
 }
 
 // -----------------------
-// Forward Pass on GPU
+// Modified Forward Pass on GPU
 // -----------------------
-// This function transfers the input vector to the device, runs forward pass kernels,
-// copies the output (and hidden layer, needed for backpropagation) back to host,
-// and applies the softmax on the output (on the host).
-void forwardGPU(NeuralNetwork* net, double* input, double* hidden, double* output) {
-    double *d_input, *d_hidden, *d_output;
-    size_t size_input = INPUT_SIZE * sizeof(double);
+// The input (d_input) is a pointer to one image (of size INPUT_SIZE) already on the device.
+void forwardGPU(NeuralNetwork* net, double* d_input, double* hidden, double* output, 
+                double* d_hidden_temp, double* d_output_temp) {
     size_t size_hidden = HIDDEN_SIZE * sizeof(double);
     size_t size_output = OUTPUT_SIZE * sizeof(double);
     
-    // Allocate temporary device memory for input, hidden, output vectors
-    cudaMalloc((void**)&d_input, size_input);
-    cudaMalloc((void**)&d_hidden, size_hidden);
-    cudaMalloc((void**)&d_output, size_output);
-    
-    // Copy host input to device
-    cudaMemcpy(d_input, input, size_input, cudaMemcpyHostToDevice);
-    
-    // Launch forward pass kernels
-    // Use one block with HIDDEN_SIZE threads for hidden layer
-    forwardHidden<<<1, HIDDEN_SIZE>>>(net->d_W1, net->d_b1, d_input, d_hidden);
+    // Run forward kernels on the provided d_input and temporary d_hidden_temp/d_output_temp.
+    forwardHidden<<<1, HIDDEN_SIZE>>>(net->d_W1, net->d_b1, d_input, d_hidden_temp);
     cudaDeviceSynchronize();
     
-    // Use one block with OUTPUT_SIZE threads for output layer
-    forwardOutput<<<1, OUTPUT_SIZE>>>(net->d_W2, net->d_b2, d_hidden, d_output);
+    forwardOutput<<<1, OUTPUT_SIZE>>>(net->d_W2, net->d_b2, d_hidden_temp, d_output_temp);
     cudaDeviceSynchronize();
     
-    // Copy hidden and output results back to host
-    cudaMemcpy(hidden, d_hidden, size_hidden, cudaMemcpyDeviceToHost);
-    cudaMemcpy(output, d_output, size_output, cudaMemcpyDeviceToHost);
+    // Copy intermediate and final results back to host for loss calculation and accuracy.
+    cudaMemcpy(hidden, d_hidden_temp, size_hidden, cudaMemcpyDeviceToHost);
+    cudaMemcpy(output, d_output_temp, size_output, cudaMemcpyDeviceToHost);
     
-    // Apply softmax on the host
     softmax(output, OUTPUT_SIZE);
-    
-    // Free temporary device memory
-    cudaFree(d_input);
-    cudaFree(d_hidden);
-    cudaFree(d_output);
 }
 
 // -----------------------
-// Backward Pass on GPU
+// Modified Backward Pass on GPU
 // -----------------------
-// This function assumes that the input, hidden, output activations and target vector are on the host.
-// It allocates temporary device memory for these vectors (and gradient vectors), launches the kernels to compute
-// gradients and update the parameters (which reside permanently on the device), then frees the temporary memory.
-void backwardGPU(NeuralNetwork* net, double* input, double* hidden, double* output, double* target) {
-    double *d_input, *d_hidden, *d_output, *d_target;
+// Instead of expecting the target label on the GPU, we pass the host target label (h_target).
+// The function computes the output gradient on the host and then copies it to the device.
+void backwardGPU(NeuralNetwork* net, double* d_input, double* d_hidden, double* d_output, double* h_target) {
     double *d_dOutput, *d_dHidden;
-    size_t size_input = INPUT_SIZE * sizeof(double);
-    size_t size_hidden = HIDDEN_SIZE * sizeof(double);
     size_t size_output = OUTPUT_SIZE * sizeof(double);
+    size_t size_hidden = HIDDEN_SIZE * sizeof(double);
     
-    // Allocate temporary device memory for input, hidden, output, target, and gradients
-    cudaMalloc((void**)&d_input, size_input);
-    cudaMalloc((void**)&d_hidden, size_hidden);
-    cudaMalloc((void**)&d_output, size_output);
-    cudaMalloc((void**)&d_target, size_output);
     cudaMalloc((void**)&d_dOutput, size_output);
     cudaMalloc((void**)&d_dHidden, size_hidden);
     
-    // Copy host data to device
-    cudaMemcpy(d_input, input, size_input, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_hidden, hidden, size_hidden, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_output, output, size_output, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_target, target, size_output, cudaMemcpyHostToDevice);
-    
-    // Compute output gradients: d_dOutput = output - target
-    computeOutputGradients<<<1, OUTPUT_SIZE>>>(d_output, d_target, d_dOutput);
+    // Compute output gradient on host:
+    double h_dOutput[OUTPUT_SIZE];
+    // Copy the forward pass output from device to host.
+    double h_output[OUTPUT_SIZE];
+    cudaMemcpy(h_output, d_output, size_output, cudaMemcpyDeviceToHost);
     cudaDeviceSynchronize();
+    for (int i = 0; i < OUTPUT_SIZE; i++) {
+        h_dOutput[i] = h_output[i] - h_target[i];
+    }
     
-    // Compute hidden gradients: d_dHidden = (W2^T * d_dOutput) * (hidden > 0)
+    // Copy computed output gradients to device.
+    cudaMemcpy(d_dOutput, h_dOutput, size_output, cudaMemcpyHostToDevice);
+    
+    // Now compute hidden gradient on the device using the computed d_dOutput.
     computeHiddenGradients<<<1, HIDDEN_SIZE>>>(net->d_W2, d_dOutput, d_hidden, d_dHidden);
     cudaDeviceSynchronize();
     
-    // Update output layer parameters: weights and biases
-    // Launch OUTPUT_SIZE blocks with HIDDEN_SIZE threads each.
+    // Update output layer parameters using d_dOutput.
     updateOutputLayer<<<OUTPUT_SIZE, HIDDEN_SIZE>>>(net->d_W2, net->d_b2, d_dOutput, d_hidden);
     cudaDeviceSynchronize();
     
-    // Update hidden layer parameters
-    // Launch HIDDEN_SIZE blocks with INPUT_SIZE threads each.
+    // Update hidden layer parameters using d_dHidden.
     updateHiddenLayer<<<HIDDEN_SIZE, INPUT_SIZE>>>(net->d_W1, net->d_b1, d_dHidden, d_input);
     cudaDeviceSynchronize();
     
-    // Free temporary device memory used for backward pass
-    cudaFree(d_input);
-    cudaFree(d_hidden);
-    cudaFree(d_output);
-    cudaFree(d_target);
     cudaFree(d_dOutput);
     cudaFree(d_dHidden);
 }
 
 // -----------------------
+// Utility: Flatten 2D host matrix into contiguous 1D array
+// -----------------------
+double* flatten2D(double** mat, int rows, int cols) {
+    double* flat = (double*)malloc(rows * cols * sizeof(double));
+    for (int i = 0; i < rows; i++) {
+        for (int j = 0; j < cols; j++) {
+            flat[i * cols + j] = mat[i][j];
+        }
+    }
+    return flat;
+}
+
+// -----------------------
 // Training and Evaluation (Host Side)
 // -----------------------
-void train(NeuralNetwork* net, double** images, double** labels, int numImages) {
+// For training, we now use the labels stored on the host (h_train_labels) rather than on the GPU.
+void train(NeuralNetwork* net, double* d_train_images, double* h_train_labels, int numImages) {
+    // Allocate temporary device memory for an image's forward pass computation.
+    double *d_input_temp, *d_hidden_temp, *d_output_temp;
+    size_t size_input = INPUT_SIZE * sizeof(double);
+    size_t size_hidden = HIDDEN_SIZE * sizeof(double);
+    size_t size_output = OUTPUT_SIZE * sizeof(double);
+    
+    cudaMalloc((void**)&d_input_temp, size_input);
+    cudaMalloc((void**)&d_hidden_temp, size_hidden);
+    cudaMalloc((void**)&d_output_temp, size_output);
+    
     clock_t total_start = clock();
     for (int epoch = 0; epoch < EPOCHS; epoch++) {
         clock_t epoch_start = clock();
         double loss = 0.0;
         int correct = 0;
+        double hidden[HIDDEN_SIZE], output[OUTPUT_SIZE];
         
         for (int i = 0; i < numImages; i++) {
-            double hidden[HIDDEN_SIZE], output[OUTPUT_SIZE];
-            // Forward pass on GPU
-            forwardGPU(net, images[i], hidden, output);
+            // Get pointer for i-th image from device memory.
+            double* d_image_i = d_train_images + i * INPUT_SIZE;
+            // Get pointer for i-th label from host (flattened labels remain on host).
+            double* h_label_i = h_train_labels + i * OUTPUT_SIZE;
             
-            // Backward pass on GPU: update network parameters (in device memory)
-            backwardGPU(net, images[i], hidden, output, labels[i]);
+            // Forward pass (d_image_i is already on the device)
+            forwardGPU(net, d_image_i, hidden, output, d_hidden_temp, d_output_temp);
+            
+            // Backward pass: use the host label directly.
+            backwardGPU(net, d_image_i, d_hidden_temp, d_output_temp, h_label_i);
             
             // Compute loss and accuracy on host
             double sample_loss = 0.0;
             for (int k = 0; k < OUTPUT_SIZE; k++)
-                sample_loss -= labels[i][k] * log(output[k]);
+                sample_loss -= h_label_i[k] * log(output[k] + 1e-8);  // add epsilon to avoid log(0)
             loss += sample_loss;
             
             int pred = 0, actual = 0;
             for (int j = 0; j < OUTPUT_SIZE; j++) {
                 if (output[j] > output[pred]) pred = j;
-                if (labels[i][j] > labels[i][actual]) actual = j;
+                if (h_label_i[j] > h_label_i[actual]) actual = j;
             }
             if (pred == actual) correct++;
         }
@@ -307,22 +300,39 @@ void train(NeuralNetwork* net, double** images, double** labels, int numImages) 
                epoch + 1, loss / numImages, (correct / (double)numImages) * 100, get_time(epoch_start));
     }
     printf("Total training time: %.3fs\n", get_time(total_start));
+    
+    cudaFree(d_input_temp);
+    cudaFree(d_hidden_temp);
+    cudaFree(d_output_temp);
 }
 
-void evaluate(NeuralNetwork* net, double** images, double** labels, int numImages) {
+// For evaluation, we similarly use the labels on the host.
+void evaluate(NeuralNetwork* net, double* d_test_images, double* h_test_labels, int numImages) {
+    double *d_hidden_temp, *d_output_temp;
+    size_t size_hidden = HIDDEN_SIZE * sizeof(double);
+    size_t size_output = OUTPUT_SIZE * sizeof(double);
+    
+    cudaMalloc((void**)&d_hidden_temp, size_hidden);
+    cudaMalloc((void**)&d_output_temp, size_output);
+    
     int correct = 0;
-    for (int i = 0; i < numImages; i++) {
-        double hidden[HIDDEN_SIZE], output[OUTPUT_SIZE];
-        forwardGPU(net, images[i], hidden, output);
+    double hidden[HIDDEN_SIZE], output[OUTPUT_SIZE];
+    for (int i = 0; i < numImages; i++){
+        double* d_image_i = d_test_images + i * INPUT_SIZE;
+        forwardGPU(net, d_image_i, hidden, output, d_hidden_temp, d_output_temp);
         
         int pred = 0, actual = 0;
-        for (int j = 0; j < OUTPUT_SIZE; j++) {
+        double* h_label_i = h_test_labels + i * OUTPUT_SIZE;
+        for (int j = 0; j < OUTPUT_SIZE; j++){
             if (output[j] > output[pred]) pred = j;
-            if (labels[i][j] > labels[i][actual]) actual = j;
+            if (h_label_i[j] > h_label_i[actual]) actual = j;
         }
         if (pred == actual) correct++;
     }
     printf("Test Accuracy: %.2f%%\n", (correct / (double)numImages) * 100);
+    
+    cudaFree(d_hidden_temp);
+    cudaFree(d_output_temp);
 }
 
 // -----------------------
@@ -375,10 +385,9 @@ double** loadMNISTLabels(const char* filename, int numLabels) {
 }
 
 // -----------------------
-// Free Network Memory (Host Side)
+// Free Network Memory (Host and Device Part)
 // -----------------------
 void freeNetwork(NeuralNetwork* net) {
-    // Free device memory
     cudaFree(net->d_W1);
     cudaFree(net->d_W2);
     cudaFree(net->d_b1);
@@ -387,22 +396,57 @@ void freeNetwork(NeuralNetwork* net) {
 }
 
 // -----------------------
-// Main Function
+// Main function
 // -----------------------
 int main() {
-    printf("MNIST Neural Network with CUDA Parameter Allocation\n\n");
-    
-    double** train_images = loadMNISTImages("data/train-images.idx3-ubyte", 60000);
-    double** train_labels = loadMNISTLabels("data/train-labels.idx1-ubyte", 60000);
-    double** test_images  = loadMNISTImages("data/t10k-images.idx3-ubyte", 10000);
-    double** test_labels  = loadMNISTLabels("data/t10k-labels.idx1-ubyte", 10000);
+    printf("MNIST Neural Network - Naive GPU Version (V2)\n\n");
+
+    // Load the entire dataset on the host (2D arrays)
+    double** train_images = loadMNISTImages("../../data/train-images.idx3-ubyte", NUM_TRAIN);
+    double** train_labels = loadMNISTLabels("../../data/train-labels.idx1-ubyte", NUM_TRAIN);
+    double** test_images  = loadMNISTImages("../../data/t10k-images.idx3-ubyte", NUM_TEST);
+    double** test_labels  = loadMNISTLabels("../../data/t10k-labels.idx1-ubyte", NUM_TEST);
+
+    // Flatten the host arrays into contiguous 1D arrays
+    double* h_train_images_flat = flatten2D(train_images, NUM_TRAIN, INPUT_SIZE);
+    double* h_train_labels_flat = flatten2D(train_labels,  NUM_TRAIN, OUTPUT_SIZE);
+    double* h_test_images_flat  = flatten2D(test_images,  NUM_TEST, INPUT_SIZE);
+    double* h_test_labels_flat  = flatten2D(test_labels,  NUM_TEST, OUTPUT_SIZE);
+
+    // Allocate device memory for the entire image dataset only (labels remain on host)
+    double *d_train_images, *d_test_images;
+    cudaMalloc((void**)&d_train_images, NUM_TRAIN * INPUT_SIZE * sizeof(double));
+    cudaMalloc((void**)&d_test_images,  NUM_TEST  * INPUT_SIZE * sizeof(double));
+
+    cudaMemcpy(d_train_images, h_train_images_flat, NUM_TRAIN * INPUT_SIZE * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_test_images,  h_test_images_flat,  NUM_TEST  * INPUT_SIZE * sizeof(double), cudaMemcpyHostToDevice);
+
+    // Free the flattened image arrays and original 2D arrays if no longer needed.
+    free(h_train_images_flat);
+    free(h_test_images_flat);
+    freeMatrix(train_images, NUM_TRAIN);
+    freeMatrix(test_images, NUM_TEST);
+    freeMatrix(train_labels, NUM_TRAIN);
+    freeMatrix(test_labels, NUM_TEST);
     
     NeuralNetwork* net = createNetwork();
     
-    train(net, train_images, train_labels, 60000);
-    evaluate(net, test_images, test_labels, 10000);
+    // Train using the dataset already resident on the GPU and labels on host.
+    train(net, d_train_images, h_train_labels_flat, NUM_TRAIN);
+    
+    // Evaluate using the dataset already resident on the GPU and labels on host.
+    evaluate(net, d_test_images, h_test_labels_flat, NUM_TEST);
     
     freeNetwork(net);
     
+    // Free device image dataset memory
+    cudaFree(d_train_images);
+    cudaFree(d_test_images);
+    
+    // Free the host label arrays, since we are keeping them.
+    free(h_train_labels_flat);
+    free(h_test_labels_flat);
+    
     return 0;
 }
+
