@@ -60,17 +60,27 @@ void softmax(double* x, int size) {
 // -----------------------
 
 // Each thread computes one neuron in the hidden layer.
+// Suggested kernel launch: <<<2, 64>>>
 __global__ void forwardHidden(double* d_W1, double* d_b1, double* d_input, double* d_hidden) 
 {
-    // Calculate global neuron index across all blocks
     int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    __shared__ double s_input[INPUT_SIZE];
+    
+    // More efficient loading with 64 threads per block
+    // Each thread loads ~12-13 elements instead of ~98
+    for (int j = threadIdx.x; j < INPUT_SIZE; j += blockDim.x) {
+        s_input[j] = d_input[j];
+    }
+    
+    __syncthreads();
     
     if(i < HIDDEN_SIZE) 
     {
         double sum = d_b1[i];
         for (int j = 0; j < INPUT_SIZE; j++)
         {
-            sum += d_W1[i * INPUT_SIZE + j] * d_input[j];
+            sum += d_W1[i * INPUT_SIZE + j] * s_input[j];
         }
         d_hidden[i] = (sum > 0) ? sum : 0;  // ReLU
     }
@@ -80,26 +90,51 @@ __global__ void forwardHidden(double* d_W1, double* d_b1, double* d_input, doubl
 __global__ void forwardOutput(double* d_W2, double* d_b2, double* d_hidden, double* d_output) 
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Shared memory for hidden layer activations
+    __shared__ double s_hidden[HIDDEN_SIZE];
+    
+    // Collaborative loading of hidden layer values into shared memory
+    // With OUTPUT_SIZE threads (typically 10 for MNIST), each thread loads multiple elements
+    for (int j = threadIdx.x; j < HIDDEN_SIZE; j += blockDim.x) {
+        s_hidden[j] = d_hidden[j];
+    }
+    
+    // Wait for all threads to finish loading
+    __syncthreads();
+    
     if(i < OUTPUT_SIZE) {
         double sum = d_b2[i];
         for (int j = 0; j < HIDDEN_SIZE; j++){
-            sum += d_W2[i * HIDDEN_SIZE + j] * d_hidden[j];
+            sum += d_W2[i * HIDDEN_SIZE + j] * s_hidden[j];
         }
         d_output[i] = sum;  // Softmax will be applied on host later
     }
 }
-
 // Compute hidden gradient: d_dHidden = (W2^T * d_dOutput) * (hidden > 0)
 // (This kernel remains unchanged.)
 __global__ void computeHiddenGradients(double* d_W2, double* d_dOutput, double* d_hidden, double* d_dHidden) 
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Create shared memory for d_dOutput (accessed by all threads)
+    __shared__ double s_dOutput[OUTPUT_SIZE];
+    
+    // Collaboratively load d_dOutput into shared memory
+    for (int j = threadIdx.x; j < OUTPUT_SIZE; j += blockDim.x) {
+        s_dOutput[j] = d_dOutput[j];
+    }
+    
+    // Ensure all threads have loaded the data
+    __syncthreads();
+    
     if(i < HIDDEN_SIZE) 
     {
         double sum = 0.0;
         for (int j = 0; j < OUTPUT_SIZE; j++)
         {
-            sum += d_W2[j * HIDDEN_SIZE + i] * d_dOutput[j];
+            // Use shared memory instead of global memory
+            sum += d_W2[j * HIDDEN_SIZE + i] * s_dOutput[j];
         }
         d_dHidden[i] = (d_hidden[i] > 0) ? sum : 0.0;
     }
@@ -107,8 +142,7 @@ __global__ void computeHiddenGradients(double* d_W2, double* d_dOutput, double* 
 
 // Update output layer weights and biases
 // Launch with OUTPUT_SIZE blocks and HIDDEN_SIZE threads per block.
-__global__ void updateOutputLayer(double* d_W2, double* d_b2, 
-    double* d_dOutput, double* d_hidden) 
+__global__ void updateOutputLayer(double* d_W2, double* d_b2, double* d_dOutput, double* d_hidden) 
 {
     int linear_idx = blockIdx.x * blockDim.x + threadIdx.x;
     int i = linear_idx / HIDDEN_SIZE; // output neuron
@@ -126,7 +160,8 @@ __global__ void updateOutputLayer(double* d_W2, double* d_b2,
 
 // Update hidden layer weights and biases
 // Launch with HIDDEN_SIZE blocks and INPUT_SIZE threads per block.
-__global__ void updateHiddenLayer(double* d_W1, double* d_b1, double* d_dHidden, double* d_input) {
+__global__ void updateHiddenLayer(double* d_W1, double* d_b1, double* d_dHidden, double* d_input) 
+{
     int i = blockIdx.x;  // hidden neuron index
     int j = threadIdx.x; // input neuron index
     if(i < HIDDEN_SIZE && j < INPUT_SIZE) {
@@ -197,11 +232,11 @@ void forwardGPU(NeuralNetwork* net, double* d_input, double* hidden, double* out
     size_t size_output = OUTPUT_SIZE * sizeof(double);
     
     // Run forward kernels on the provided d_input and temporary d_hidden_temp/d_output_temp.
-    forwardHidden<<<16, 8>>>(net->d_W1, net->d_b1, d_input, d_hidden_temp);
+    forwardHidden<<<4, 32>>>(net->d_W1, net->d_b1, d_input, d_hidden_temp);
     
     cudaDeviceSynchronize();
     
-    forwardOutput<<<1, OUTPUT_SIZE>>>(net->d_W2, net->d_b2, d_hidden_temp, d_output_temp);
+    forwardOutput<<<1, 64>>>(net->d_W2, net->d_b2, d_hidden_temp, d_output_temp);
     cudaDeviceSynchronize();
     
     // Copy intermediate and final results back to host for loss calculation and accuracy.
@@ -216,7 +251,8 @@ void forwardGPU(NeuralNetwork* net, double* d_input, double* hidden, double* out
 // -----------------------
 // Instead of expecting the target label on the GPU, we pass the host target label (h_target).
 // The function computes the output gradient on the host and then copies it to the device.
-void backwardGPU(NeuralNetwork* net, double* d_input, double* d_hidden, double* d_output, double* h_target) {
+void backwardGPU(NeuralNetwork* net, double* d_input, double* d_hidden, double* d_output, double* h_target) 
+{
     double *d_dOutput, *d_dHidden;
     size_t size_output = OUTPUT_SIZE * sizeof(double);
     size_t size_hidden = HIDDEN_SIZE * sizeof(double);
@@ -256,10 +292,13 @@ void backwardGPU(NeuralNetwork* net, double* d_input, double* d_hidden, double* 
 // -----------------------
 // Utility: Flatten 2D host matrix into contiguous 1D array
 // -----------------------
-double* flatten2D(double** mat, int rows, int cols) {
+double* flatten2D(double** mat, int rows, int cols) 
+{
     double* flat = (double*)malloc(rows * cols * sizeof(double));
-    for (int i = 0; i < rows; i++) {
-        for (int j = 0; j < cols; j++) {
+    for (int i = 0; i < rows; i++) 
+    {
+        for (int j = 0; j < cols; j++) 
+        {
             flat[i * cols + j] = mat[i][j];
         }
     }
@@ -416,8 +455,9 @@ void freeNetwork(NeuralNetwork* net) {
 // -----------------------
 // Main function
 // -----------------------
-int main() {
-    printf("MNIST Neural Network - Optimized GPU Version (V3)\n(Updated: Launch Configurations)\n\n");
+int main() 
+{
+    printf("MNIST Neural Network - Optimized GPU Version (V3)\n(Update: Launch Configurations)\n(Update: Shared Memory Usage)\n\n");
 
     // Load the entire dataset on the host (2D arrays)
     double** train_images = loadMNISTImages("../../data/train-images.idx3-ubyte", NUM_TRAIN);
