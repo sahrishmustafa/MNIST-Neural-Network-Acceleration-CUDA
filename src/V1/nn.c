@@ -11,6 +11,10 @@
 #define BATCH_SIZE 64
 #define NUM_CLASSES 10  // Digits 0-9
 
+
+double kernel_time = 0.0;
+
+
 // Timer function
 double get_time(clock_t start) {
     return (double)(clock() - start) / CLOCKS_PER_SEC;
@@ -81,6 +85,8 @@ NeuralNetwork* createNetwork() {
 
 // Forward pass
 void forward(NeuralNetwork* net, double* input, double* hidden, double* output) {
+    clock_t kernel_start = clock();
+
     for (int i = 0; i < HIDDEN_SIZE; i++) {
         hidden[i] = net->b1[i];
         for (int j = 0; j < INPUT_SIZE; j++)
@@ -94,12 +100,14 @@ void forward(NeuralNetwork* net, double* input, double* hidden, double* output) 
             output[i] += net->W2[i][j] * hidden[j];
     }
     softmax(output, OUTPUT_SIZE);
+    kernel_time += get_time(kernel_start);
 }
 
 // Backpropagation
 void backward(NeuralNetwork* net, double* input, double* hidden, double* output, double* target) {
     double d_output[OUTPUT_SIZE], d_hidden[HIDDEN_SIZE];
 
+    clock_t kernel_start = clock();
     // Compute output layer gradient
     for (int i = 0; i < OUTPUT_SIZE; i++)
         d_output[i] = output[i] - target[i];
@@ -126,6 +134,8 @@ void backward(NeuralNetwork* net, double* input, double* hidden, double* output,
 
     for (int i = 0; i < HIDDEN_SIZE; i++)
         net->b1[i] -= LEARNING_RATE * d_hidden[i];
+        
+    kernel_time += get_time(kernel_start);
 }
 
 // Train network
@@ -239,16 +249,26 @@ void freeNetwork(NeuralNetwork* net) {
 
 // Main function
 int main() {
+    
     printf("MNIST Neural Network\n\n");
 
-    double** train_images = loadMNISTImages("data/train-images.idx3-ubyte", 60000);
-    double** train_labels = loadMNISTLabels("data/train-labels.idx1-ubyte", 60000);
-    double** test_images = loadMNISTImages("data/t10k-images.idx3-ubyte", 10000);
-    double** test_labels = loadMNISTLabels("data/t10k-labels.idx1-ubyte", 10000);
-
+    double** train_images = loadMNISTImages("../data/train-images.idx3-ubyte", 60000);
+    double** train_labels = loadMNISTLabels("../data/train-labels.idx1-ubyte", 60000);
+    double** test_images = loadMNISTImages("../data/t10k-images.idx3-ubyte", 10000);
+    double** test_labels = loadMNISTLabels("../data/t10k-labels.idx1-ubyte", 10000);
+    
     NeuralNetwork* net = createNetwork();
+    clock_t app_start = clock();  // Start app-level timing
+
     train(net, train_images, train_labels, 60000);
     evaluate(net, test_images, test_labels, 10000);
+
+    double app_time = get_time(app_start);
+
+    printf("\n--- Final Report ---\n");
+    printf("Application-Level Time (Train + Eval): %.3fs\n", app_time);
+    printf("Kernel Time (loops inside forward/backward): %.3fs\n", kernel_time);
+    printf("---------------------\n");
 
     freeNetwork(net);
     return 0;
