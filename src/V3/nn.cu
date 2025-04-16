@@ -144,31 +144,40 @@ __global__ void computeHiddenGradients(double* d_W2, double* d_dOutput, double* 
 // Launch with OUTPUT_SIZE blocks and HIDDEN_SIZE threads per block.
 __global__ void updateOutputLayer(double* d_W2, double* d_b2, double* d_dOutput, double* d_hidden) 
 {
-    int linear_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int i = linear_idx / HIDDEN_SIZE; // output neuron
-    int j = linear_idx % HIDDEN_SIZE; // hidden neuron
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if(i < OUTPUT_SIZE && j < HIDDEN_SIZE) {
-    d_W2[i * HIDDEN_SIZE + j] -= LEARNING_RATE * d_dOutput[i] * d_hidden[j];
+    int totalWeights = OUTPUT_SIZE * HIDDEN_SIZE;
+    if (idx < totalWeights) {
+        int i = idx / HIDDEN_SIZE; // output neuron index
+        int j = idx % HIDDEN_SIZE; // hidden neuron index
+        d_W2[idx] -= LEARNING_RATE * d_dOutput[i] * d_hidden[j];
     }
 
-    // Bias updates (single thread per output neuron)
-    if(linear_idx < OUTPUT_SIZE) {
-    d_b2[linear_idx] -= LEARNING_RATE * d_dOutput[linear_idx];
+    // Optional: Bias update (if combined)
+    int biasIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (biasIdx < OUTPUT_SIZE && threadIdx.x == 0) {
+        d_b2[biasIdx] -= LEARNING_RATE * d_dOutput[biasIdx];
     }
 }
+
 
 // Update hidden layer weights and biases
 // Launch with HIDDEN_SIZE blocks and INPUT_SIZE threads per block.
 __global__ void updateHiddenLayer(double* d_W1, double* d_b1, double* d_dHidden, double* d_input) 
 {
-    int i = blockIdx.x;  // hidden neuron index
-    int j = threadIdx.x; // input neuron index
-    if(i < HIDDEN_SIZE && j < INPUT_SIZE) {
-        d_W1[i * INPUT_SIZE + j] -= LEARNING_RATE * d_dHidden[i] * d_input[j];
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;  // Flattened thread index
+
+    int totalWeights = HIDDEN_SIZE * INPUT_SIZE;
+    if (idx < totalWeights) {
+        int i = idx / INPUT_SIZE; // hidden neuron index
+        int j = idx % INPUT_SIZE; // input neuron index
+        d_W1[idx] -= LEARNING_RATE * d_dHidden[i] * d_input[j];
     }
-    if(j == 0 && i < HIDDEN_SIZE) {
-        d_b1[i] -= LEARNING_RATE * d_dHidden[i];
+
+    // Use separate kernel for biases, or just have fewer threads handle this:
+    int biasIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (biasIdx < HIDDEN_SIZE && threadIdx.x == 0) {
+        d_b1[biasIdx] -= LEARNING_RATE * d_dHidden[biasIdx];
     }
 }
 
@@ -277,12 +286,20 @@ void backwardGPU(NeuralNetwork* net, double* d_input, double* d_hidden, double* 
     computeHiddenGradients<<<16, 4>>>(net->d_W2, d_dOutput, d_hidden, d_dHidden);
     cudaDeviceSynchronize();
     
+    int totalWeights = OUTPUT_SIZE * HIDDEN_SIZE;
+    int threadsPerBlock = 256;
+    int blocks = (totalWeights + threadsPerBlock - 1) / threadsPerBlock;
     // Update output layer parameters using d_dOutput.
-    updateOutputLayer<<<OUTPUT_SIZE, HIDDEN_SIZE>>>(net->d_W2, net->d_b2, d_dOutput, d_hidden);
+    updateOutputLayer<<<blocks, threadsPerBlock>>>(net-> d_W2, net->d_b2, d_dOutput, d_hidden);
     cudaDeviceSynchronize();
     
+
+    totalWeights = HIDDEN_SIZE * INPUT_SIZE;
+    threadsPerBlock = 256;
+    blocks = (totalWeights + threadsPerBlock - 1) / threadsPerBlock;
+    
     // Update hidden layer parameters using d_dHidden.
-    updateHiddenLayer<<<HIDDEN_SIZE, INPUT_SIZE>>>(net->d_W1, net->d_b1, d_dHidden, d_input);
+    updateHiddenLayer<<<blocks, threadsPerBlock>>>(net->d_W1, net->d_b1, d_dHidden, d_input);
     cudaDeviceSynchronize();
     
     cudaFree(d_dOutput);
@@ -444,7 +461,8 @@ double** loadMNISTLabels(const char* filename, int numLabels) {
 // -----------------------
 // Free Network Memory (Host and Device Part)
 // -----------------------
-void freeNetwork(NeuralNetwork* net) {
+void freeNetwork(NeuralNetwork* net) 
+{
     cudaFree(net->d_W1);
     cudaFree(net->d_W2);
     cudaFree(net->d_b1);
@@ -457,7 +475,7 @@ void freeNetwork(NeuralNetwork* net) {
 // -----------------------
 int main() 
 {
-    printf("MNIST Neural Network - Optimized GPU Version (V3)\n(Update: Launch Configurations)\n(Update: Shared Memory Usage)\n\n");
+    printf("MNIST Neural Network - Optimized GPU Version (V3)\n(Update: Launch Configurations)\n(Update: Shared Memory Usage)\n(Update: Occupancy Updated)\n(Update: Communication Optimized)\n\n");
 
     // Load the entire dataset on the host (2D arrays)
     double** train_images = loadMNISTImages("../../data/train-images.idx3-ubyte", NUM_TRAIN);
