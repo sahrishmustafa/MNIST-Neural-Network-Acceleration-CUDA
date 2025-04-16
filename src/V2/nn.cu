@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <time.h>
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
@@ -14,6 +15,12 @@
 #define NUM_CLASSES   10  // Digits 0-9
 #define NUM_TRAIN     60000
 #define NUM_TEST      10000
+
+float kernelTime = 0.0f;
+float memcpyTime = 0.0f;
+clock_t appStart, appEnd;
+cudaEvent_t kStart, kStop, mStart, mStop;
+
 
 // Timer function
 double get_time(clock_t start) {
@@ -159,11 +166,17 @@ NeuralNetwork* createNetwork() {
         h_W2[i] = ((double)rand() / RAND_MAX) * 0.01;
     }
     
+    cudaEventRecord(mStart);
     // Copy initialized parameters to device
     cudaMemcpy(net->d_W1, h_W1, HIDDEN_SIZE * INPUT_SIZE * sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(net->d_W2, h_W2, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(net->d_b1, h_b1, HIDDEN_SIZE * sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(net->d_b2, h_b2, OUTPUT_SIZE * sizeof(double), cudaMemcpyHostToDevice);
+    cudaEventRecord(mStop);
+    cudaEventSynchronize(mStop);
+    float tempMemcpyTime;
+    cudaEventElapsedTime(&tempMemcpyTime, mStart, mStop);
+    memcpyTime += tempMemcpyTime;
     
     free(h_W1); free(h_W2); free(h_b1); free(h_b2);
     
@@ -180,15 +193,32 @@ void forwardGPU(NeuralNetwork* net, double* d_input, double* hidden, double* out
     size_t size_output = OUTPUT_SIZE * sizeof(double);
     
     // Run forward kernels on the provided d_input and temporary d_hidden_temp/d_output_temp.
+    cudaEventRecord(kStart);
     forwardHidden<<<1, HIDDEN_SIZE>>>(net->d_W1, net->d_b1, d_input, d_hidden_temp);
     cudaDeviceSynchronize();
+    cudaEventRecord(kStop);
+    cudaEventSynchronize(kStop);
+    float tempKernelTime;   
+    cudaEventElapsedTime(&tempKernelTime, kStart, kStop);
+    kernelTime += tempKernelTime;
     
+    cudaEventRecord(kStart);
     forwardOutput<<<1, OUTPUT_SIZE>>>(net->d_W2, net->d_b2, d_hidden_temp, d_output_temp);
     cudaDeviceSynchronize();
+    cudaEventRecord(kStop);
+    cudaEventSynchronize(kStop);
+    cudaEventElapsedTime(&tempKernelTime, kStart, kStop);
+    kernelTime += tempKernelTime;
     
     // Copy intermediate and final results back to host for loss calculation and accuracy.
+    cudaEventRecord(mStart);
     cudaMemcpy(hidden, d_hidden_temp, size_hidden, cudaMemcpyDeviceToHost);
     cudaMemcpy(output, d_output_temp, size_output, cudaMemcpyDeviceToHost);
+    cudaEventRecord(mStop);
+    cudaEventSynchronize(mStop);
+    float tempMemcpyTime;
+    cudaEventElapsedTime(&tempMemcpyTime, mStart, mStop);
+    memcpyTime += tempMemcpyTime;
     
     softmax(output, OUTPUT_SIZE);
 }
@@ -198,7 +228,7 @@ void forwardGPU(NeuralNetwork* net, double* d_input, double* hidden, double* out
 // -----------------------
 // Instead of expecting the target label on the GPU, we pass the host target label (h_target).
 // The function computes the output gradient on the host and then copies it to the device.
-void backwardGPU(NeuralNetwork* net, double* d_input, double* d_hidden, double* d_output, double* h_target) {
+void backwardGPU(NeuralNetwork* net, double* d_input, double* d_hidden, double* h_output_softmax, double* h_target) {
     double *d_dOutput, *d_dHidden;
     size_t size_output = OUTPUT_SIZE * sizeof(double);
     size_t size_hidden = HIDDEN_SIZE * sizeof(double);
@@ -206,30 +236,49 @@ void backwardGPU(NeuralNetwork* net, double* d_input, double* d_hidden, double* 
     cudaMalloc((void**)&d_dOutput, size_output);
     cudaMalloc((void**)&d_dHidden, size_hidden);
     
-    // Compute output gradient on host:
+    // Compute output gradient on host using softmax outputs.
     double h_dOutput[OUTPUT_SIZE];
-    // Copy the forward pass output from device to host.
-    double h_output[OUTPUT_SIZE];
-    cudaMemcpy(h_output, d_output, size_output, cudaMemcpyDeviceToHost);
-    cudaDeviceSynchronize();
     for (int i = 0; i < OUTPUT_SIZE; i++) {
-        h_dOutput[i] = h_output[i] - h_target[i];
+        h_dOutput[i] = h_output_softmax[i] - h_target[i];
     }
-    
     // Copy computed output gradients to device.
+    cudaEventRecord(mStart);
     cudaMemcpy(d_dOutput, h_dOutput, size_output, cudaMemcpyHostToDevice);
-    
+    cudaDeviceSynchronize();
+    cudaEventRecord(mStop);
+    cudaEventSynchronize(mStop);
+    float tempMemcpyTime;
+    cudaEventElapsedTime(&tempMemcpyTime, mStart, mStop);
+    memcpyTime += tempMemcpyTime;
+
     // Now compute hidden gradient on the device using the computed d_dOutput.
+    cudaEventRecord(kStart);
     computeHiddenGradients<<<1, HIDDEN_SIZE>>>(net->d_W2, d_dOutput, d_hidden, d_dHidden);
     cudaDeviceSynchronize();
+    cudaEventRecord(kStop);
+    cudaEventSynchronize(kStop);  
+    float tempKernelTime;
+    cudaEventElapsedTime(&tempKernelTime, kStart, kStop);
+    kernelTime += tempKernelTime;
+    
     
     // Update output layer parameters using d_dOutput.
+    cudaEventRecord(kStart);
     updateOutputLayer<<<OUTPUT_SIZE, HIDDEN_SIZE>>>(net->d_W2, net->d_b2, d_dOutput, d_hidden);
     cudaDeviceSynchronize();
+    cudaEventRecord(kStop);
+    cudaEventSynchronize(kStop);  
+    cudaEventElapsedTime(&tempKernelTime, kStart, kStop);
+    kernelTime += tempKernelTime;
     
     // Update hidden layer parameters using d_dHidden.
+    cudaEventRecord(kStart);
     updateHiddenLayer<<<HIDDEN_SIZE, INPUT_SIZE>>>(net->d_W1, net->d_b1, d_dHidden, d_input);
     cudaDeviceSynchronize();
+    cudaEventRecord(kStop);
+    cudaEventSynchronize(kStop);  
+    cudaEventElapsedTime(&tempKernelTime, kStart, kStop);
+    kernelTime += tempKernelTime;
     
     cudaFree(d_dOutput);
     cudaFree(d_dHidden);
@@ -280,7 +329,7 @@ void train(NeuralNetwork* net, double* d_train_images, double* h_train_labels, i
             forwardGPU(net, d_image_i, hidden, output, d_hidden_temp, d_output_temp);
             
             // Backward pass: use the host label directly.
-            backwardGPU(net, d_image_i, d_hidden_temp, d_output_temp, h_label_i);
+            backwardGPU(net, d_image_i, d_hidden_temp, output, h_label_i);
             
             // Compute loss and accuracy on host
             double sample_loss = 0.0;
@@ -399,6 +448,9 @@ void freeNetwork(NeuralNetwork* net) {
 // Main function
 // -----------------------
 int main() {
+    cudaEventCreate(&kStart); cudaEventCreate(&kStop);
+    cudaEventCreate(&mStart); cudaEventCreate(&mStop);
+
     printf("MNIST Neural Network - Naive GPU Version (V2)\n\n");
 
     // Load the entire dataset on the host (2D arrays)
@@ -418,8 +470,14 @@ int main() {
     cudaMalloc((void**)&d_train_images, NUM_TRAIN * INPUT_SIZE * sizeof(double));
     cudaMalloc((void**)&d_test_images,  NUM_TEST  * INPUT_SIZE * sizeof(double));
 
+    cudaEventRecord(mStart);
     cudaMemcpy(d_train_images, h_train_images_flat, NUM_TRAIN * INPUT_SIZE * sizeof(double), cudaMemcpyHostToDevice);
     cudaMemcpy(d_test_images,  h_test_images_flat,  NUM_TEST  * INPUT_SIZE * sizeof(double), cudaMemcpyHostToDevice);
+    cudaEventRecord(mStop);
+    cudaEventSynchronize(mStop);
+    float tempMemcpyTime;
+    cudaEventElapsedTime(&tempMemcpyTime, mStart, mStop);
+    memcpyTime += tempMemcpyTime;
 
     // Free the flattened image arrays and original 2D arrays if no longer needed.
     free(h_train_images_flat);
@@ -430,6 +488,7 @@ int main() {
     freeMatrix(test_labels, NUM_TEST);
     
     NeuralNetwork* net = createNetwork();
+    
     
     // Train using the dataset already resident on the GPU and labels on host.
     train(net, d_train_images, h_train_labels_flat, NUM_TRAIN);
@@ -446,7 +505,15 @@ int main() {
     // Free the host label arrays, since we are keeping them.
     free(h_train_labels_flat);
     free(h_test_labels_flat);
+
+    appEnd = clock();
+    double appTimeSec = get_time(appStart); // From your `get_time` function
+    
+    printf("\n--- Timing Summary ---\n");
+    printf("Total Application Time (s): %.4f\n", appTimeSec);
+    printf("Total Memcpy Time (ms): %.4f\n", memcpyTime);
+    printf("Total Kernel Time (ms): %.4f\n", kernelTime);
+    printf("Application-Level Time (s) = Kernel + Memcpy: %.4f\n", (kernelTime + memcpyTime) / 1000.0);
     
     return 0;
 }
-

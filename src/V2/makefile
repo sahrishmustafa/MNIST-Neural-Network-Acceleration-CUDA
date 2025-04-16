@@ -2,7 +2,7 @@
 NVCC = nvcc
 
 # Compiler Flags
-NVFLAGS = -arch=sm_75
+NVFLAGS = -arch=sm_75 
 
 # Source Files
 SRC = nn.cu
