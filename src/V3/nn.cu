@@ -78,10 +78,13 @@ __global__ void forwardHidden(half* d_W1, half* d_b1, half* d_input, half* d_hid
 
     if (i < HIDDEN_SIZE) {
         float sum = __half2float(d_b1[i]);  // Convert to float for accumulation
-        // Access W1 with better memory coalescing
+        
+        // Access TRANSPOSED W1 with better memory coalescing
+        // Now threads in a warp access consecutive memory locations for better performance
         for (int j = 0; j < INPUT_SIZE; j++) {
-            sum += __half2float(d_W1[i * INPUT_SIZE + j]) * __half2float(s_input[j]);
+            sum += __half2float(d_W1[j * HIDDEN_SIZE + i]) * __half2float(s_input[j]);
         }
+        
         // Convert back to half for storage
         d_hidden[i] = __float2half(fmaxf(0.0f, sum));  // ReLU in float precision
     }
@@ -181,10 +184,11 @@ __global__ void updateHiddenLayer(half* d_W1, half* d_b1, half* d_dHidden, half*
 
     int totalWeights = HIDDEN_SIZE * INPUT_SIZE;
     if (idx < totalWeights) {
-        int i = idx / INPUT_SIZE; // hidden neuron index
-        int j = idx % INPUT_SIZE; // input neuron index
+        // For transposed W1 format, we need to transpose indices
+        int j = idx / HIDDEN_SIZE; // input neuron index (first dimension in transposed format)
+        int i = idx % HIDDEN_SIZE; // hidden neuron index (second dimension in transposed format)
         
-        // Compute weight update
+        // Compute weight update for transposed format
         float weight = __half2float(d_W1[idx]);
         float dHidden = __half2float(d_dHidden[i]);
         float input = __half2float(d_input[j]);
@@ -192,7 +196,7 @@ __global__ void updateHiddenLayer(half* d_W1, half* d_b1, half* d_dHidden, half*
         d_W1[idx] = __float2half(weight);
     }
 
-    // Use separate kernel for biases, or just have fewer threads handle this:
+    // Bias update remains the same
     int biasIdx = blockIdx.x * blockDim.x + threadIdx.x;
     if (biasIdx < HIDDEN_SIZE && threadIdx.x == 0) {
         float bias = __half2float(d_b1[biasIdx]);
@@ -205,10 +209,11 @@ __global__ void updateHiddenLayer(half* d_W1, half* d_b1, half* d_dHidden, half*
 // -----------------------
 // Neural Network Structure (Parameters reside on device)
 // -----------------------
+// Modified network structure to indicate transposed W1
 typedef struct 
 {
     // Device pointers for parameters (flattened arrays)
-    half* d_W1; // [HIDDEN_SIZE x INPUT_SIZE]
+    half* d_W1; // [INPUT_SIZE x HIDDEN_SIZE] - TRANSPOSED for better memory access
     half* d_W2; // [OUTPUT_SIZE x HIDDEN_SIZE]
     half* d_b1; // [HIDDEN_SIZE]
     half* d_b2; // [OUTPUT_SIZE]
@@ -248,9 +253,14 @@ NeuralNetwork* createNetwork()
     half* h_b1_half = (half*)malloc(HIDDEN_SIZE * sizeof(half));
     half* h_b2_half = (half*)malloc(OUTPUT_SIZE * sizeof(half));
     
-    for (int i = 0; i < HIDDEN_SIZE * INPUT_SIZE; i++) {
-        h_W1_half[i] = __float2half((float)h_W1[i]);
+    // TRANSPOSITION: Store W1 in transposed format for better memory access
+    for (int i = 0; i < HIDDEN_SIZE; i++) {
+        for (int j = 0; j < INPUT_SIZE; j++) {
+            // Store in transposed format: [j][i] instead of [i][j]
+            h_W1_half[j * HIDDEN_SIZE + i] = __float2half((float)h_W1[i * INPUT_SIZE + j]);
+        }
     }
+    
     for (int i = 0; i < OUTPUT_SIZE * HIDDEN_SIZE; i++) {
         h_W2_half[i] = __float2half((float)h_W2[i]);
     }
@@ -548,7 +558,7 @@ void freeNetwork(NeuralNetwork* net)
 int main() 
 {
     printf("MNIST Neural Network - Optimized GPU Version (V3)\n(Update: Launch Configurations)\n(Update: Shared Memory Usage)\n(Update: Occupancy Updated)\n(Update: Communication Optimized)\n");
-    printf("(Update: Using half-precision (FP16) for increased performance)\n\n");
+    printf("(Update: Using half-precision (FP16) for increased performance)\n(Update: Coalesced the strided memory accesses)\n\n");
 
     // Load the entire dataset on the host (2D arrays)
     double** train_images = loadMNISTImages("../../data/train-images.idx3-ubyte", NUM_TRAIN);
