@@ -328,8 +328,7 @@ void forwardGPU(NeuralNetwork* net, half* d_input, double* hidden, double* outpu
 // -----------------------
 // Instead of expecting the target label on the GPU, we pass the host target label (h_target).
 // The function computes the output gradient on the host and then copies it to the device.
-void backwardGPU(NeuralNetwork* net, half* d_input, half* d_hidden, half* d_output, double* h_target) 
-{
+void backwardGPU(NeuralNetwork* net, half* d_input, half* d_hidden, double* h_output_softmax, double* h_target) {
     half *d_dOutput, *d_dHidden;
     size_t size_output = OUTPUT_SIZE * sizeof(half);
     size_t size_hidden = HIDDEN_SIZE * sizeof(half);
@@ -337,25 +336,10 @@ void backwardGPU(NeuralNetwork* net, half* d_input, half* d_hidden, half* d_outp
     cudaMalloc((void**)&d_dOutput, size_output);
     cudaMalloc((void**)&d_dHidden, size_hidden);
     
-    // Compute output gradient on host:
+    // Compute output gradient on host using softmax outputs
     double h_dOutput[OUTPUT_SIZE];
-    // Copy the forward pass output from device to host.
-    double h_output[OUTPUT_SIZE];
-    
-    // Temporary array for half-precision output
-    half* h_output_half = (half*)malloc(size_output);
-    cudaMemcpy(h_output_half, d_output, size_output, cudaMemcpyDeviceToHost);
-    cudaDeviceSynchronize();
-    
-    // Convert from half to double
     for (int i = 0; i < OUTPUT_SIZE; i++) {
-        h_output[i] = (double)__half2float(h_output_half[i]);
-    }
-    free(h_output_half);
-    
-    // Compute gradients (still in double)
-    for (int i = 0; i < OUTPUT_SIZE; i++) {
-        h_dOutput[i] = h_output[i] - h_target[i];
+        h_dOutput[i] = h_output_softmax[i] - h_target[i];
     }
     
     // Convert gradients to half for device transfer
@@ -364,33 +348,30 @@ void backwardGPU(NeuralNetwork* net, half* d_input, half* d_hidden, half* d_outp
         h_dOutput_half[i] = __float2half((float)h_dOutput[i]);
     }
     
-    // Copy computed output gradients to device.
+    // Copy gradients to device
     cudaMemcpy(d_dOutput, h_dOutput_half, size_output, cudaMemcpyHostToDevice);
     free(h_dOutput_half);
     
-    // Now compute hidden gradient on the device using the computed d_dOutput.
+    // Compute hidden gradients (unchanged)
     computeHiddenGradients<<<16, 4>>>(net->d_W2, d_dOutput, d_hidden, d_dHidden);
     cudaDeviceSynchronize();
     
+    // Update output layer (unchanged)
     int totalWeights = OUTPUT_SIZE * HIDDEN_SIZE;
     int threadsPerBlock = 256;
     int blocks = (totalWeights + threadsPerBlock - 1) / threadsPerBlock;
-    // Update output layer parameters using d_dOutput.
     updateOutputLayer<<<blocks, threadsPerBlock>>>(net->d_W2, net->d_b2, d_dOutput, d_hidden);
     cudaDeviceSynchronize();
     
+    // Update hidden layer (unchanged)
     totalWeights = HIDDEN_SIZE * INPUT_SIZE;
-    threadsPerBlock = 256;
     blocks = (totalWeights + threadsPerBlock - 1) / threadsPerBlock;
-    
-    // Update hidden layer parameters using d_dHidden.
     updateHiddenLayer<<<blocks, threadsPerBlock>>>(net->d_W1, net->d_b1, d_dHidden, d_input);
     cudaDeviceSynchronize();
     
     cudaFree(d_dOutput);
     cudaFree(d_dHidden);
 }
-
 // -----------------------
 // Utility: Flatten 2D host matrix into contiguous 1D array
 // -----------------------
@@ -437,7 +418,7 @@ void train(NeuralNetwork* net, half* d_train_images, double* h_train_labels, int
             forwardGPU(net, d_image_i, hidden, output, d_hidden_temp, d_output_temp);
             
             // Backward pass: use the host label directly.
-            backwardGPU(net, d_image_i, d_hidden_temp, d_output_temp, h_label_i);
+            backwardGPU(net, d_image_i, d_hidden_temp, output, h_label_i);
             
             // Compute loss and accuracy on host
             double sample_loss = 0.0;
