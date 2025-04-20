@@ -32,3 +32,49 @@ This repository contains multiple implementations of a simple Neural Network (NN
 │       └── Makefile
 │
 └── README.md
+
+
+---
+
+## Project Objective
+
+To evaluate and benchmark different parallel programming models for neural network training on the MNIST dataset using:
+
+- **Serial execution (CPU)**
+- **CUDA-based GPU acceleration (naive and optimized)**
+- **Tensor Core acceleration with batching**
+- **OpenACC-based GPU parallelism**
+
+---
+
+## Prerequisites
+
+- **Linux/Unix-based OS**
+- **CUDA Toolkit** (for V2, V3, V4)
+- **NVIDIA GPU** (Tensor Cores recommended for V4)
+- **OpenACC compiler** (e.g., PGI/NVIDIA HPC compiler) for V5
+- GCC for serial version
+- Make utility
+
+---
+
+## How to Build and Run
+
+### Step 1: Prepare the Dataset
+
+Place the following MNIST files inside the `/data` directory:
+
+- `train-images.idx3-ubyte`
+- `train-labels.idx1-ubyte`
+- `t10k-images.idx3-ubyte`
+- `t10k-labels.idx1-ubyte`
+---
+
+### Step 2: Navigate to Any Version
+
+For example, to run the **serial implementation**:
+
+```bash
+cd src/V1
+make
+./run
