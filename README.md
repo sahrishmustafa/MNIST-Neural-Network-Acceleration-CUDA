@@ -33,9 +33,7 @@ This repository contains multiple implementations of a simple Neural Network (NN
 │
 └── README.md
 
-
----
-
+```
 ## Project Objective
 
 To evaluate and benchmark different parallel programming models for neural network training on the MNIST dataset using:
