@@ -1,43 +1,58 @@
-# Compiler
+# Optimized Makefile for CUDA Neural Network
+
+# CUDA Compiler
 NVCC = nvcc
 
-# Compiler Flags for compilation
-NVCCFLAGS = -arch=sm_75 --expt-relaxed-constexpr \
-            -D_MWAITXINTRIN_H_INCLUDED -D_FORCE_INLINES \
-            -O3 --use_fast_math --fmad=true \
-            -Xcompiler -fopenmp
+# Check compute capability of the device
+COMPUTE_CAPABILITY = $(shell nvcc --help | grep -o "compute_[0-9]*" | sort -r | head -1 | cut -d'_' -f2)
+ifeq ($(COMPUTE_CAPABILITY),)
+    ARCH = sm_80  # Default to Ampere architecture if detection fails
+else ifeq ($(shell test $(COMPUTE_CAPABILITY) -ge 80; echo $$?),0)
+    ARCH = sm_80  # Ampere architecture (RTX 30xx)
+	endif
 
-# Separate linker flags
-LDFLAGS = -lcublas -lcublasLt -lcudart
+NVFLAGS = -arch=$(ARCH) \
+          -O3 \
+          -lineinfo \
+          --use_fast_math \
+          --default-stream per-thread \
+          -Xcompiler -fopenmp \
+          -lcublas
 
-# Source Files
+# Debug flags to use when debugging is needed
+DEBUG_FLAGS = -g -G -Xcompiler -rdynamic -lineinfo
+
+# Source, executable names, and data directory
 SRC = nn.cu
-OBJ = nn.o
-DLINKOBJ = dlink.o
 EXE = exe
+DATA_DIR = data
 
-# Default rule to compile everything
+# Default rule
 all: $(EXE)
 
-# Rule to compile CUDA source files into object files (separate compilation)
-%.o: %.cu
-	$(NVCC) $(NVCCFLAGS) -dc $< -o $@
+# Rule to compile and link
+$(EXE): $(SRC)
+	$(NVCC) $(NVFLAGS) $< -o $@
 
-# Device linking step (necessary when using -dc)
-$(DLINKOBJ): $(OBJ)
-	$(NVCC) $(NVCCFLAGS) -dlink $(OBJ) -o $(DLINKOBJ)
-
-# Final executable link step
-$(EXE): $(OBJ) $(DLINKOBJ)
-	$(NVCC) $(NVCCFLAGS) $(OBJ) $(DLINKOBJ) -o $(EXE) $(LDFLAGS)
+# Debug build
+debug: $(SRC)
+	$(NVCC) $(NVFLAGS) $(DEBUG_FLAGS) $< -o $(EXE)_debug
 
 # Clean command to remove compiled files
 clean:
-	rm -f $(OBJ) $(DLINKOBJ) $(EXE) profile.txt
+	rm -f $(EXE) $(EXE)_debug *.o
 
-# Profile and run
-profile: $(EXE)
-	nvprof ./$(EXE) --metrics all --log-file profile.txt
-
+# Run command
 run: $(EXE)
 	./$(EXE)
+
+# Run with profiling
+profile: $(EXE)
+	nsys profile --stats=true ./$(EXE)
+
+# Run with detailed memory profiling
+memcheck: $(EXE)
+	cuda-memcheck ./$(EXE)
+
+# Standard targets
+.PHONY: all clean run profile memcheck debug data

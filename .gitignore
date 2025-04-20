@@ -1,0 +1,5 @@
+# Ignore everything inside src/
+src/*
+
+# But not src/V4/
+!src/V4/
